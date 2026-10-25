@@ -564,8 +564,10 @@ here supersede estimates elsewhere.\n\n## Summary\n\n| Area | Done | Partial | M
         "Budgets: `perf/budgets.toml` (targets from #209, #210, #211). Numbers: the committed baseline \
 (`perf/baseline.json`, full run), updated only by `cargo xtask perf --update-baseline`. The nightly \
 `perf-nightly` workflow runs `cargo xtask perf` on a fixed macOS runner and fails on a broken enforced \
-budget or a p50 regression over {:.0} % against a baseline from the same machine class. \"Over budget\" \
-rows are targets the code doesn't meet yet: they are reported, and only their regressions fail.\n\n",
+budget, a p50 regression over {:.0} % against a baseline from the same machine class, or a baseline from \
+another machine class (record it on the runner: run the workflow with `update_baseline`). \"Over budget\" \
+rows are targets the code doesn't meet yet: they are reported, and only their regressions fail. \
+\"Command + refresh\" splits a row's median between the command and the canvas refresh after it.\n\n",
         inp.budgets.settings.regression_pct
     ));
     match (&base_date, full) {
@@ -573,8 +575,9 @@ rows are targets the code doesn't meet yet: they are reported, and only their re
             let load = perf::fmt_load(f.get("load_avg_start"));
             let commit = f.get("commit").and_then(Value::as_str).map_or_else(|| "unknown".into(), |c| c.get(..10).unwrap_or(c).to_string());
             let ram = machine.and_then(|m| m.get("ram_bytes")).and_then(Value::as_u64).map_or_else(|| "?".into(), |b| format!("{} GB", b >> 30));
+            let cores = machine.and_then(|m| m.get("cores")).and_then(Value::as_u64).map_or_else(String::new, |n| format!("{n} cores, "));
             s.push_str(&format!(
-                "Baseline: {d}, commit `{commit}`, {} ({ram}), GPU {}, {}; load average {load} (1/5/15 min) at the start of the run.\n\n",
+                "Baseline: {d}, commit `{commit}`, {} ({cores}{ram}), GPU {}, {}; load average {load} (1/5/15 min) at the start of the run.\n\n",
                 ms("cpu"),
                 ms("gpu_adapter"),
                 ms("os_version")

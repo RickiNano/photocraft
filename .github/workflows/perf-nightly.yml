@@ -7,7 +7,9 @@ name: Perf (nightly)
 # never compared). The table goes to the job summary; results.json is uploaded as an artifact.
 #
 # To give this runner class its own baseline: run it by hand with "update_baseline", download
-# the `perf-baseline` artifact and commit it as perf/baseline.json in a PR.
+# the `perf-baseline` artifact and commit it as perf/baseline.json in a PR. Full runs pass
+# --require-baseline: a baseline from another machine class fails them, since nothing could be
+# compared (a laptop baseline once left the regression check off for weeks).
 
 on:
   schedule:
@@ -57,7 +59,7 @@ jobs:
           UPDATE: ${{ inputs.update_baseline }}
         run: |
           args=()
-          if [ "$QUICK" = "true" ]; then args+=(--quick); fi
+          if [ "$QUICK" = "true" ]; then args+=(--quick); else args+=(--require-baseline); fi
           if [ "$UPDATE" = "true" ]; then args+=(--update-baseline); fi
           cargo xtask perf "${args[@]}"
 

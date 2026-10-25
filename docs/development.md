@@ -407,6 +407,7 @@ cargo xtask scorecard --check    # what CI runs: fails if the committed file is 
 cargo xtask perf                 # full benchmark run (tens of minutes, release build)
 cargo xtask perf --quick         # small synthetic documents (about a minute once built)
 cargo xtask perf --update-baseline   # also write perf/baseline.json from this run
+cargo xtask perf --require-baseline  # fail when no baseline from this machine class exists (the nightly)
 ```
 
 **Sources.** The scorecard reads only committed files, so it is deterministic:
@@ -422,7 +423,10 @@ cargo xtask perf --update-baseline   # also write perf/baseline.json from this r
   a number.
 - `perf/baseline.json`: the numbers the scorecard shows, written only by
   `cargo xtask perf --update-baseline`, with the machine (CPU, RAM, GPU adapter, OS), its machine
-  class, commit, date and load average.
+  class, commit, date and load average. Record it on the nightly's runner: run the `perf-nightly`
+  workflow by hand with `update_baseline` and commit its `perf-baseline` artifact. The nightly
+  passes `--require-baseline`, so a baseline from any other machine fails it instead of quietly
+  turning the regression check off.
 - `crates/io/tests/it/corpus.rs`: the corpus floors (every `Source { .. }` constant).
 - The prefs audit: `Preferences` fields that no code reads (target 0, #204), plus counts taken
   from the tree (never-crash attribute coverage, `docs/parity-checklist.md`).
@@ -432,15 +436,20 @@ cargo xtask perf --update-baseline   # also write perf/baseline.json from this r
 `--json`, and merges the reports into `target/perf/results.json` keyed by scenario id, with p50,
 p95 and max (nearest rank over the samples), peak RSS measured in-process (`photocraft-testkit`'s
 `perf::RssSampler`), GPU bytes held by the canvas, and the load average before and after each
-bench. `target/perf/summary.md` is the Markdown table. It exits non-zero when an enforced budget
-breaks, when a scenario's p50 regresses more than 15 % (`--threshold`, or `regression_pct`)
-against a baseline from the same machine class and mode, or when a bench fails. Runs from
-different machine classes are never compared, and `--quick` numbers are only compared with a
-quick baseline. Machines that run other work give noisy numbers: check the load average in the
+bench. Rows that refresh the canvas also give the command's and the refresh's medians and what
+the refresh was (`gpu-rect`, `gpu-full`, `cpu`…): the "Command + refresh p50" column.
+`perf_scenarios` takes up to 40 samples a row and stops once a row has 5 and has run for 20 s,
+times the CPU canvas where the app would fall back to it, keeps only the measured document on
+the GPU and sizes the GPU memory budget as the app does. `target/perf/summary.md` is the
+Markdown table. It exits non-zero when an enforced budget breaks, when a scenario's p50
+regresses more than 15 % (`--threshold`, or `regression_pct`) against a baseline from the same
+machine class and mode, when a bench fails, or with `--require-baseline` when there is no such
+baseline. Runs from different machine classes are never compared, and `--quick` numbers are
+only compared with a quick baseline. Machines that run other work give noisy numbers: check the load average in the
 summary before trusting a regression, and record it next to any number you quote.
 
 **Measuring one scenario.** A full run is tens of minutes; one row is seconds once its bench is
-built. `xtask perf`'s own flags are `--quick`, `--update-baseline`, `--threshold`, `--bench`
+built. `xtask perf`'s own flags are `--quick`, `--update-baseline`, `--require-baseline`, `--threshold`, `--bench`
 (repeatable, one bench per name), `--skip-build` and `--reuse`; it has no way to pick a single
 *row*. The bench binary takes those filters itself — `--only <substring>` (row names are matched
 with `contains`), `--group <name>` and `--reps N` — so to time one row run the bench directly:

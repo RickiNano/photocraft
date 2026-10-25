@@ -185,6 +185,13 @@ pub struct Stats {
     pub max: Option<f64>,
     pub peak_rss: Option<u64>,
     pub gpu_bytes: Option<u64>,
+    /// Rows that refresh the canvas: the median of the command's own time and of the refresh's,
+    /// so a slow row says which side to look at.
+    pub cmd_p50: Option<f64>,
+    pub refresh_p50: Option<f64>,
+    /// What those refreshes were ("gpu-rect"; "gpu-rect 38, cpu 2" when they differed): a GPU
+    /// row whose canvas went to the CPU shows it here.
+    pub canvas: Option<String>,
 }
 
 impl Stats {
@@ -197,7 +204,17 @@ impl Stats {
     }
 
     pub fn to_json(&self) -> Value {
-        json!({"n": self.n, "p50_ms": self.p50, "p95_ms": self.p95, "max_ms": self.max, "peak_rss_bytes": self.peak_rss, "gpu_bytes": self.gpu_bytes})
+        let mut v =
+            json!({"n": self.n, "p50_ms": self.p50, "p95_ms": self.p95, "max_ms": self.max, "peak_rss_bytes": self.peak_rss, "gpu_bytes": self.gpu_bytes});
+        if let Some(o) = v.as_object_mut() {
+            // Only rows that refresh the canvas carry the split.
+            if self.cmd_p50.is_some() || self.refresh_p50.is_some() || self.canvas.is_some() {
+                o.insert("cmd_p50_ms".into(), json!(self.cmd_p50));
+                o.insert("refresh_p50_ms".into(), json!(self.refresh_p50));
+                o.insert("canvas".into(), json!(self.canvas));
+            }
+        }
+        v
     }
 
     pub fn from_json(v: &Value) -> Self {
@@ -208,6 +225,9 @@ impl Stats {
             max: v.get("max_ms").and_then(Value::as_f64),
             peak_rss: v.get("peak_rss_bytes").and_then(Value::as_u64),
             gpu_bytes: v.get("gpu_bytes").and_then(Value::as_u64),
+            cmd_p50: v.get("cmd_p50_ms").and_then(Value::as_f64),
+            refresh_p50: v.get("refresh_p50_ms").and_then(Value::as_f64),
+            canvas: v.get("canvas").and_then(Value::as_str).map(str::to_string),
         }
     }
 }
@@ -222,13 +242,31 @@ fn rank(v: &[f64], q: f64) -> Option<f64> {
     v.get(k - 1).copied()
 }
 
+/// The finite numbers of `row[key]`, sorted.
+fn sorted_samples(row: &Value, key: &str) -> Vec<f64> {
+    let mut v: Vec<f64> =
+        row.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_f64).filter(|x| x.is_finite()).collect()).unwrap_or_default();
+    v.sort_by(f64::total_cmp);
+    v
+}
+
+/// A row's `refresh_kinds` (`{"gpu-rect": 38, "cpu": 2}`) as one short label.
+fn canvas_label(row: &Value) -> Option<String> {
+    let kinds = row.get("refresh_kinds")?.as_object()?;
+    let counts: Vec<(&String, u64)> = kinds.iter().filter_map(|(k, n)| Some((k, n.as_u64()?))).filter(|(_, n)| *n > 0).collect();
+    match counts.as_slice() {
+        [] => None,
+        [(k, _)] => Some((*k).clone()),
+        _ => Some(counts.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", ")),
+    }
+}
+
 /// A bench row → stats. Rows carry `samples_ms` (preferred: percentiles are recomputed here),
 /// or `p50_ms`/`p95_ms`/`max_ms`, or the older `median_ms`/`max_ms`. A p95 is never invented:
-/// with neither samples nor a reported p95 it stays empty.
+/// with neither samples nor a reported p95 it stays empty. Rows that refresh the canvas also
+/// carry `cmd_samples_ms`, `refresh_samples_ms` and `refresh_kinds`.
 pub fn row_stats(row: &Value) -> Stats {
-    let mut samples: Vec<f64> =
-        row.get("samples_ms").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_f64).filter(|x| x.is_finite()).collect()).unwrap_or_default();
-    samples.sort_by(f64::total_cmp);
+    let samples = sorted_samples(row, "samples_ms");
     let f = |k: &str| row.get(k).and_then(Value::as_f64);
     let mut s = Stats {
         n: samples.len(),
@@ -237,6 +275,9 @@ pub fn row_stats(row: &Value) -> Stats {
         max: f("max_ms"),
         peak_rss: row.get("peak_rss_bytes").and_then(Value::as_u64),
         gpu_bytes: row.get("gpu_bytes").and_then(Value::as_u64),
+        cmd_p50: rank(&sorted_samples(row, "cmd_samples_ms"), 0.5),
+        refresh_p50: rank(&sorted_samples(row, "refresh_samples_ms"), 0.5),
+        canvas: canvas_label(row),
     };
     if !samples.is_empty() {
         s.p50 = rank(&samples, 0.5);
@@ -411,6 +452,18 @@ pub fn fmt_bytes(v: Option<u64>) -> String {
     }
 }
 
+/// "0.15 + 4.21 (gpu-rect)": the command's and the canvas refresh's medians and what the refresh
+/// was; "–" for a row that doesn't refresh the canvas (or a baseline from before the split).
+fn fmt_split(st: &Stats) -> String {
+    match (st.cmd_p50, st.refresh_p50) {
+        (Some(c), Some(r)) => {
+            let canvas = st.canvas.as_deref().map_or_else(String::new, |k| format!(" ({k})"));
+            format!("{} + {}{canvas}", fmt_num(c), fmt_num(r))
+        }
+        _ => "–".into(),
+    }
+}
+
 pub fn issue_link(n: Option<u32>) -> String {
     n.map_or_else(String::new, |n| format!("[#{n}](https://github.com/storytold/photocraft/issues/{n})"))
 }
@@ -420,24 +473,25 @@ pub fn issue_link(n: Option<u32>) -> String {
 pub fn render_table(outcomes: &[Outcome], with_baseline: bool) -> String {
     let mut s = if with_baseline {
         String::from(
-            "| Id | Scenario | Target | p50 ms | p95 ms | max ms | Peak RSS | GPU | vs baseline | Status | Issue |\n|---|---|---|---:|---:|---:|---:|---:|---:|---|---|\n",
+            "| Id | Scenario | Target | p50 ms | p95 ms | max ms | Command + refresh p50 ms | Peak RSS | GPU | vs baseline | Status | Issue |\n|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|\n",
         )
     } else {
         String::from(
-            "| Id | Scenario | Target | p50 ms | p95 ms | max ms | Peak RSS | GPU | Status | Issue |\n|---|---|---|---:|---:|---:|---:|---:|---|---|\n",
+            "| Id | Scenario | Target | p50 ms | p95 ms | max ms | Command + refresh p50 ms | Peak RSS | GPU | Status | Issue |\n|---|---|---|---:|---:|---:|---:|---:|---:|---|---|\n",
         )
     };
     for o in outcomes.iter().filter(|o| !matches!(o.status, Status::NotMeasurable(_))) {
         let st = o.stats.clone().unwrap_or_default();
         let vs = if with_baseline { format!(" {} |", o.change_pct.map_or_else(|| "–".into(), |c| format!("{c:+.0} %"))) } else { String::new() };
         s.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |{} {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |{} {} | {} |\n",
             o.id,
             o.title,
             o.target,
             fmt_ms(st.p50),
             fmt_ms(st.p95),
             fmt_ms(st.max),
+            fmt_split(&st),
             fmt_bytes(st.peak_rss),
             fmt_bytes(st.gpu_bytes),
             vs,
@@ -625,6 +679,8 @@ pub fn updated_baseline(old: Option<&Value>, results: &Value) -> Value {
 struct Opts {
     quick: bool,
     update_baseline: bool,
+    /// Fail when there is no baseline from this machine class to compare with (the nightly).
+    require_baseline: bool,
     threshold: Option<f64>,
     benches: Vec<String>,
     skip_build: bool,
@@ -632,12 +688,13 @@ struct Opts {
 }
 
 fn parse_opts(rest: &[&str]) -> Result<Opts, String> {
-    let mut o = Opts { quick: false, update_baseline: false, threshold: None, benches: Vec::new(), skip_build: false, reuse: false };
+    let mut o = Opts { quick: false, update_baseline: false, require_baseline: false, threshold: None, benches: Vec::new(), skip_build: false, reuse: false };
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match *a {
             "--quick" => o.quick = true,
             "--update-baseline" => o.update_baseline = true,
+            "--require-baseline" => o.require_baseline = true,
             "--skip-build" => o.skip_build = true,
             "--reuse" => {
                 o.reuse = true;
@@ -652,6 +709,13 @@ fn parse_opts(rest: &[&str]) -> Result<Opts, String> {
         }
     }
     Ok(o)
+}
+
+/// With `--require-baseline` (the nightly), a run that can't be compared with the baseline fails
+/// instead of noting it: a baseline recorded on another machine class (or none) otherwise turns
+/// the regression check off without anyone noticing. A run that records the baseline is exempt.
+fn baseline_failure(o: &Opts, note: Option<&str>) -> Option<String> {
+    (o.require_baseline && !o.update_baseline).then_some(note).flatten().map(|n| format!("--require-baseline: {n}"))
 }
 
 fn target_dir() -> Result<PathBuf, String> {
@@ -820,7 +884,8 @@ pub fn run(root: &Path, rest: &[&str]) -> Result<(), String> {
         })
         .collect();
     let failures: Vec<String> = outcomes.iter().filter(|o| o.status.fails()).map(|o| format!("{} {}: {}", o.id, o.title, o.status.label())).collect();
-    let bench_failures: Vec<String> = reports.iter().filter_map(|(n, r)| r.as_ref().err().map(|e| format!("bench {n}: {e}"))).collect();
+    let mut bench_failures: Vec<String> = reports.iter().filter_map(|(n, r)| r.as_ref().err().map(|e| format!("bench {n}: {e}"))).collect();
+    bench_failures.extend(baseline_failure(&o, baseline_note.as_deref()));
     let commit = git(root, &["rev-parse", "HEAD"]);
     let dirty = git(root, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
     let results = json!({
@@ -1017,6 +1082,28 @@ not_measurable = "needs a frame harness"
         assert_eq!((s.p50, s.p95, s.max), (Some(4.0), None, Some(9.0)));
         let s = row_stats(&json!({"name": "x", "samples_ms": ["bad", null]}));
         assert_eq!(s.p50, None);
+        assert_eq!((s.cmd_p50, s.refresh_p50, s.canvas), (None, None, None), "no split on rows without a refresh");
+    }
+
+    #[test]
+    fn row_stats_split_command_and_refresh() {
+        let row = json!({
+            "name": "x",
+            "samples_ms": [11.0, 12.0, 13.0],
+            "cmd_samples_ms": [1.0, 3.0, 2.0],
+            "refresh_samples_ms": [10.0, 9.0, 11.0],
+            "refresh_kinds": {"gpu-rect": 3},
+        });
+        let s = row_stats(&row);
+        assert_eq!((s.cmd_p50, s.refresh_p50, s.canvas.as_deref()), (Some(2.0), Some(10.0), Some("gpu-rect")));
+        // Mixed refreshes are all named, with their counts (a GPU row that fell back shows it).
+        let s = row_stats(&json!({"name": "x", "samples_ms": [1.0], "refresh_kinds": {"gpu-rect": 38, "cpu": 2, "none": 0}}));
+        assert_eq!(s.canvas.as_deref(), Some("cpu 2, gpu-rect 38"));
+        // The split survives the baseline's JSON; rows without one don't grow the keys.
+        let full = row_stats(&row);
+        assert_eq!(Stats::from_json(&full.to_json()), full);
+        let plain = Stats { p50: Some(1.0), ..Default::default() }.to_json();
+        assert!(plain.get("cmd_p50_ms").is_none() && plain.get("canvas").is_none());
     }
 
     #[test]
@@ -1110,12 +1197,33 @@ not_measurable = "needs a frame harness"
     fn table_lists_not_measurable_rows_separately() {
         let b = parse_budgets(TOML).unwrap();
         let mut reports = BTreeMap::new();
-        reports.insert("b".to_string(), Ok(report(json!([{"name": "move row", "samples_ms": [10.0], "peak_rss_bytes": 3u64 << 30}]))));
+        reports.insert(
+            "b".to_string(),
+            Ok(report(json!([
+                {"name": "move row", "samples_ms": [10.0], "peak_rss_bytes": 3u64 << 30},
+                {"name": "opacity row", "samples_ms": [12.5], "cmd_samples_ms": [0.5], "refresh_samples_ms": [12.0], "refresh_kinds": {"gpu-rect": 1}},
+            ]))),
+        );
         let t = render_table(&evaluate(&b, &reports, None, 15.0, true), true);
-        assert!(t.contains("| P1 | move | ≤ 25 ms p95 | 10.0 | 10.0 | 10.0 | 3.0 GB |"));
+        assert!(t.contains("| P1 | move | ≤ 25 ms p95 | 10.0 | 10.0 | 10.0 | – | 3.0 GB |"), "{t}");
+        assert!(t.contains("| P2 | opacity | ≤ 20 ms p95 | 12.5 | 12.5 | 12.5 | 0.50 + 12.0 (gpu-rect) |"), "{t}");
         assert!(t.contains("**Not measurable yet**"));
         assert!(t.contains("| P3 | zoom | ≤ 16 ms per frame | needs a frame harness |  |"));
-        assert_eq!(counts(&evaluate(&b, &reports, None, 15.0, true)), (1, 1, 0, 1), "the row the bench lacks counts as failing");
+        assert_eq!(counts(&evaluate(&b, &reports, None, 15.0, true)), (2, 0, 0, 1));
+        let mut lacking = BTreeMap::new();
+        lacking.insert("b".to_string(), Ok(report(json!([{"name": "move row", "samples_ms": [10.0]}]))));
+        assert_eq!(counts(&evaluate(&b, &lacking, None, 15.0, true)), (1, 1, 0, 1), "the row the bench lacks counts as failing");
+    }
+
+    #[test]
+    fn require_baseline_fails_a_run_with_nothing_to_compare() {
+        let note = Some("baseline is from machine class `a`, this is `b`: regression check skipped");
+        let o = parse_opts(&["--require-baseline"]).unwrap();
+        assert!(baseline_failure(&o, note).is_some_and(|e| e.contains("machine class `a`")));
+        assert_eq!(baseline_failure(&o, None), None, "a same-class baseline: nothing to report");
+        // Without the flag a skipped check stays a note; recording the baseline is exempt.
+        assert_eq!(baseline_failure(&parse_opts(&[]).unwrap(), note), None);
+        assert_eq!(baseline_failure(&parse_opts(&["--require-baseline", "--update-baseline"]).unwrap(), note), None);
     }
 
     #[test]
