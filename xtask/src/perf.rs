@@ -2,13 +2,16 @@
 //! by scenario id, and check it against `perf/budgets.toml` and `perf/baseline.json` (#221).
 //!
 //! ```text
-//! cargo xtask perf [--quick] [--update-baseline] [--threshold PCT] [--bench NAME]... [--skip-build] [--reuse]
+//! cargo xtask perf [--quick] [--update-baseline] [--require-baseline] [--threshold PCT] [--bench NAME]... [--skip-build] [--reuse]
+//! cargo xtask perf --update-baseline --baseline-from results.json [--baseline-from results.json]...
 //! ```
 //!
 //! - `--quick`: only the benches with `quick_args` (small synthetic documents; minutes, not tens
 //!   of minutes). Quick numbers are compared only with a quick baseline, and budgets don't apply
 //!   (they are set for the full-size documents).
 //! - `--update-baseline`: write this run into `perf/baseline.json` (the only way it changes).
+//!   With `--baseline-from`, nothing runs: each scenario comes from the run with its median p50.
+//! - `--require-baseline`: fail when there is no baseline from this machine class and mode.
 //! - `--threshold PCT`: the regression threshold (default `settings.regression_pct`, 15 %).
 //! - `--bench NAME`: run only these benches (repeatable).
 //! - `--skip-build`: don't run `cargo build` first. `--reuse`: don't run the benches either;
@@ -18,8 +21,9 @@
 //! nightly job posts as its summary) and one `target/perf/<bench>.json` per bench.
 //!
 //! Exit status: non-zero when an enforced budget breaks (full mode), a scenario's p50 regresses
-//! more than the threshold against a baseline from the same machine class and mode, or a bench
-//! fails. Runs from different machine classes are never compared.
+//! more than the threshold against a baseline from the same machine class and mode (unless
+//! `settings.regressions_fail` is off: then it is only reported), or a bench fails. Runs from
+//! different machine classes are never compared.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::collections::BTreeMap;
@@ -54,11 +58,14 @@ pub struct Settings {
     pub regression_pct: f64,
     /// …and by more than this many milliseconds (timer noise on sub-millisecond rows).
     pub regression_min_ms: f64,
+    /// Whether a regression fails the run, or is only reported (a runner too noisy to tell a
+    /// regression from a slow night).
+    pub regressions_fail: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { regression_pct: 15.0, regression_min_ms: 1.0 }
+        Self { regression_pct: 15.0, regression_min_ms: 1.0, regressions_fail: true }
     }
 }
 
@@ -334,6 +341,11 @@ impl Status {
     }
     pub fn fails(&self) -> bool {
         matches!(self, Status::Broken | Status::Regressed | Status::Missing(_))
+    }
+
+    /// [`Status::fails`], except that a regression is only reported when `settings` say so.
+    pub fn fails_under(&self, settings: &Settings) -> bool {
+        self.fails() && (settings.regressions_fail || *self != Status::Regressed)
     }
 }
 
@@ -660,18 +672,73 @@ pub fn updated_baseline(old: Option<&Value>, results: &Value) -> Value {
         .and_then(Value::as_object)
         .map(|m| m.iter().filter_map(|(k, v)| v.get("status")?.as_str()?.strip_prefix(MISSING_PREFIX).map(|e| (k.clone(), json!(e)))).collect())
         .unwrap_or_default();
-    modes.insert(
-        mode,
-        json!({
-            "date": results.get("date"),
-            "commit": results.get("commit"),
-            "load_avg_start": results.get("load_avg_start"),
-            "load_avg_end": results.get("load_avg_end"),
-            "scenarios": scenarios,
-            "failed": failed,
-        }),
-    );
+    let mut entry = json!({
+        "date": results.get("date"),
+        "commit": results.get("commit"),
+        "load_avg_start": results.get("load_avg_start"),
+        "load_avg_end": results.get("load_avg_end"),
+        "scenarios": scenarios,
+        "failed": failed,
+    });
+    // A baseline merged from several runs ([`merged_results`]) says how many.
+    if let (Some(n), Some(o)) = (results.get("runs").filter(|n| !n.is_null()), entry.as_object_mut()) {
+        o.insert("runs".into(), n.clone());
+    }
+    modes.insert(mode, entry);
     json!({"schema": 1, "machine_class": class, "machine": results.get("machine"), "modes": modes})
+}
+
+/// The median of the finite values.
+fn median(v: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut xs: Vec<f64> = v.filter(|x| x.is_finite()).collect();
+    xs.sort_by(f64::total_cmp);
+    rank(&xs, 0.5)
+}
+
+/// Several runs' `results.json` from one machine class and mode as one result, for
+/// `--baseline-from`: each scenario's numbers are those of the run with its median p50 (the lower
+/// middle one for an even count) among the runs that measured it, and a scenario no run measured
+/// keeps what the latest run said about it. A baseline from a noisy runner then shows a typical
+/// night rather than one night's luck. Date, commit and machine are the latest run's; the load
+/// averages are medians.
+pub fn merged_results(runs: &[Value]) -> Result<Value, String> {
+    let first = runs.first().ok_or("--baseline-from: no results to merge")?;
+    let key = |r: &Value| (r.get("machine").and_then(|m| m.get("class")).cloned(), r.get("mode").cloned());
+    if let Some(other) = runs.iter().find(|r| key(r) != key(first)) {
+        return Err(format!("--baseline-from: results from different machine classes or modes ({:?} and {:?})", key(first), key(other)));
+    }
+    let date = |r: &Value| r.get("date").and_then(Value::as_str).unwrap_or("").to_string();
+    let latest = runs.iter().max_by_key(|r| date(r)).unwrap_or(first);
+    let ids: std::collections::BTreeSet<&String> = runs.iter().filter_map(|r| r.get("scenarios")?.as_object()).flat_map(|m| m.keys()).collect();
+    let mut scenarios = serde_json::Map::new();
+    for id in ids {
+        let measured: Vec<Stats> =
+            runs.iter().filter_map(|r| r.get("scenarios")?.get(id)).filter(|v| v.get("p50_ms").is_some_and(|x| !x.is_null())).map(Stats::from_json).collect();
+        let mut measured = measured;
+        measured.sort_by(|a, b| a.p50.unwrap_or(f64::NAN).total_cmp(&b.p50.unwrap_or(f64::NAN)));
+        // All of a scenario's numbers come from one run, so its p95, split and memory belong
+        // together.
+        match measured.len().checked_sub(1).and_then(|last| measured.get(last / 2)) {
+            Some(mid) => scenarios.insert(id.clone(), mid.to_json()),
+            None => latest.get("scenarios").and_then(|m| m.get(id)).and_then(|v| scenarios.insert(id.clone(), v.clone())),
+        };
+    }
+    let loads = |k: &str| -> Option<Value> {
+        let arrays: Vec<Vec<f64>> = runs.iter().filter_map(|r| r.get(k)?.as_array().map(|a| a.iter().filter_map(Value::as_f64).collect())).collect();
+        let m: Vec<f64> = (0..3).map_while(|i| median(arrays.iter().filter_map(|a| a.get(i).copied()))).collect();
+        (m.len() == 3).then(|| json!(m))
+    };
+    Ok(json!({
+        "schema": 1,
+        "mode": first.get("mode"),
+        "machine": latest.get("machine"),
+        "date": latest.get("date"),
+        "commit": latest.get("commit"),
+        "load_avg_start": loads("load_avg_start"),
+        "load_avg_end": loads("load_avg_end"),
+        "runs": runs.len(),
+        "scenarios": scenarios,
+    }))
 }
 
 // ---- running ---------------------------------------------------------------------------------
@@ -681,6 +748,9 @@ struct Opts {
     update_baseline: bool,
     /// Fail when there is no baseline from this machine class to compare with (the nightly).
     require_baseline: bool,
+    /// With `update_baseline`: write the baseline from these runs' `results.json` (per scenario,
+    /// the run with its median p50) instead of running the benches.
+    baseline_from: Vec<String>,
     threshold: Option<f64>,
     benches: Vec<String>,
     skip_build: bool,
@@ -688,13 +758,23 @@ struct Opts {
 }
 
 fn parse_opts(rest: &[&str]) -> Result<Opts, String> {
-    let mut o = Opts { quick: false, update_baseline: false, require_baseline: false, threshold: None, benches: Vec::new(), skip_build: false, reuse: false };
+    let mut o = Opts {
+        quick: false,
+        update_baseline: false,
+        require_baseline: false,
+        baseline_from: Vec::new(),
+        threshold: None,
+        benches: Vec::new(),
+        skip_build: false,
+        reuse: false,
+    };
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match *a {
             "--quick" => o.quick = true,
             "--update-baseline" => o.update_baseline = true,
             "--require-baseline" => o.require_baseline = true,
+            "--baseline-from" => o.baseline_from.push(it.next().ok_or("--baseline-from needs a results.json")?.to_string()),
             "--skip-build" => o.skip_build = true,
             "--reuse" => {
                 o.reuse = true;
@@ -709,6 +789,28 @@ fn parse_opts(rest: &[&str]) -> Result<Opts, String> {
         }
     }
     Ok(o)
+}
+
+/// `--update-baseline --baseline-from a.json --baseline-from b.json …`: the baseline from runs
+/// already made (the nightly's `perf-results` artifacts): per scenario, the run with its median p50.
+fn baseline_from_runs(root: &Path, o: &Opts) -> Result<(), String> {
+    if !o.update_baseline {
+        return Err("--baseline-from writes the baseline: pass --update-baseline too".into());
+    }
+    let runs = o
+        .baseline_from
+        .iter()
+        .map(|p| std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}")).and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| format!("{p}: {e}"))))
+        .collect::<Result<Vec<_>, _>>()?;
+    let merged = merged_results(&runs)?;
+    let old: Option<Value> = std::fs::read_to_string(root.join(BASELINE)).ok().and_then(|t| serde_json::from_str(&t).ok());
+    let nb = updated_baseline(old.as_ref(), &merged);
+    let text = serde_json::to_string_pretty(&nb).map_err(|e| format!("encode baseline: {e}"))?;
+    write(&root.join(BASELINE), &format!("{text}\n"))?;
+    let class = merged.get("machine").and_then(|m| m.get("class")).and_then(Value::as_str).unwrap_or("?");
+    let mode = merged.get("mode").and_then(Value::as_str).unwrap_or("?");
+    println!("updated {BASELINE}: per scenario, the run with its median p50 among {} runs ({mode}, machine class {class})", runs.len());
+    Ok(())
 }
 
 /// With `--require-baseline` (the nightly), a run that can't be compared with the baseline fails
@@ -732,6 +834,9 @@ fn write(path: &Path, text: &str) -> Result<(), String> {
 
 pub fn run(root: &Path, rest: &[&str]) -> Result<(), String> {
     let o = parse_opts(rest)?;
+    if !o.baseline_from.is_empty() {
+        return baseline_from_runs(root, &o);
+    }
     let text = std::fs::read_to_string(root.join(BUDGETS)).map_err(|e| format!("read {BUDGETS}: {e}"))?;
     let budgets = parse_budgets(&text)?;
     let mode = if o.quick { "quick" } else { "full" };
@@ -883,7 +988,8 @@ pub fn run(root: &Path, rest: &[&str]) -> Result<(), String> {
             (sc.id.clone(), v)
         })
         .collect();
-    let failures: Vec<String> = outcomes.iter().filter(|o| o.status.fails()).map(|o| format!("{} {}: {}", o.id, o.title, o.status.label())).collect();
+    let failures: Vec<String> =
+        outcomes.iter().filter(|o| o.status.fails_under(&budgets.settings)).map(|o| format!("{} {}: {}", o.id, o.title, o.status.label())).collect();
     let mut bench_failures: Vec<String> = reports.iter().filter_map(|(n, r)| r.as_ref().err().map(|e| format!("bench {n}: {e}"))).collect();
     bench_failures.extend(baseline_failure(&o, baseline_note.as_deref()));
     let commit = git(root, &["rev-parse", "HEAD"]);
@@ -906,7 +1012,16 @@ pub fn run(root: &Path, rest: &[&str]) -> Result<(), String> {
     let text = serde_json::to_string_pretty(&results).map_err(|e| format!("encode results: {e}"))?;
     write(&out_dir.join("results.json"), &text)?;
 
-    let summary = render_summary(&results, &outcomes, baseline_note.as_deref());
+    let regressed: Vec<&str> = outcomes.iter().filter(|o| o.status == Status::Regressed).map(|o| o.id.as_str()).collect();
+    let notes: Vec<String> = baseline_note
+        .iter()
+        .cloned()
+        .chain(
+            (!regressed.is_empty() && !budgets.settings.regressions_fail)
+                .then(|| format!("p50 over {threshold:.0} % above the baseline (reported, not failed: `regressions_fail = false`): {}", regressed.join(", "))),
+        )
+        .collect();
+    let summary = render_summary(&results, &outcomes, &notes);
     write(&out_dir.join("summary.md"), &summary)?;
     println!("\n{summary}");
     println!("wrote {}", out_dir.join("results.json").display());
@@ -957,7 +1072,7 @@ pub fn fmt_load(v: Option<&Value>) -> String {
 }
 
 /// The Markdown summary of one run: context lines and the scenario table.
-pub fn render_summary(results: &Value, outcomes: &[Outcome], baseline_note: Option<&str>) -> String {
+pub fn render_summary(results: &Value, outcomes: &[Outcome], notes: &[String]) -> String {
     let m = results.get("machine").cloned().unwrap_or(Value::Null);
     let s = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or("unknown").to_string();
     let ram = m.get("ram_bytes").and_then(Value::as_u64).map_or_else(|| "?".into(), |b| format!("{} GB", b >> 30));
@@ -976,7 +1091,7 @@ pub fn render_summary(results: &Value, outcomes: &[Outcome], baseline_note: Opti
         fmt_load(results.get("load_avg_start")),
         fmt_load(results.get("load_avg_end")),
     );
-    if let Some(n) = baseline_note {
+    for n in notes {
         out.push_str(&format!("- {n}\n"));
     }
     if results.get("mode").and_then(Value::as_str) == Some("quick") {
@@ -1235,5 +1350,57 @@ not_measurable = "needs a frame harness"
         assert!(o.quick && o.reuse && o.skip_build);
         assert_eq!(o.threshold, Some(20.0));
         assert_eq!(o.benches, ["a"]);
+        assert!(parse_opts(&["--baseline-from"]).is_err(), "needs a file");
+        let o = parse_opts(&["--update-baseline", "--baseline-from", "a.json", "--baseline-from", "b.json"]).unwrap();
+        assert_eq!(o.baseline_from, ["a.json", "b.json"]);
+    }
+
+    #[test]
+    fn regressions_can_be_reported_without_failing() {
+        let b = parse_budgets(TOML).unwrap();
+        assert!(b.settings.regressions_fail, "failing is the default");
+        let quiet = parse_budgets(&TOML.replace("regression_min_ms = 0.5", "regression_min_ms = 0.5\nregressions_fail = false")).unwrap();
+        assert!(!quiet.settings.regressions_fail);
+        assert!(Status::Regressed.fails_under(&b.settings));
+        assert!(!Status::Regressed.fails_under(&quiet.settings), "reported only");
+        // Everything else fails as before.
+        assert!(Status::Broken.fails_under(&quiet.settings));
+        assert!(Status::Missing("boom".into()).fails_under(&quiet.settings));
+        assert!(!Status::Over.fails_under(&quiet.settings));
+    }
+
+    #[test]
+    fn baseline_from_several_runs_takes_each_scenarios_median() {
+        let run = |date: &str, p50: f64, load: f64, canvas: &str| {
+            json!({
+                "mode": "full", "date": date, "commit": format!("c-{date}"),
+                "machine": {"class": "runner"},
+                "load_avg_start": [load, load, load],
+                "scenarios": {
+                    "P1": {"n": 40, "p50_ms": p50, "p95_ms": p50 * 2.0, "max_ms": p50 * 3.0, "peak_rss_bytes": 100, "gpu_bytes": 10,
+                           "cmd_p50_ms": p50 / 10.0, "refresh_p50_ms": p50 - 1.0, "canvas": canvas},
+                    "P2": {"status": "**missing**: panicked: boom"},
+                },
+            })
+        };
+        // The slow night (90) doesn't move it: every number comes from the median run (22), so the split
+        // still adds up. The latest run gives date and commit.
+        let runs = [run("2026-10-25", 20.0, 10.0, "gpu-rect"), run("2026-10-27", 90.0, 30.0, "rect"), run("2026-10-26", 22.0, 20.0, "gpu-rect")];
+        let m = merged_results(&runs).unwrap();
+        assert_eq!((m["runs"].as_u64(), m["date"].as_str(), m["commit"].as_str()), (Some(3), Some("2026-10-27"), Some("c-2026-10-27")));
+        assert_eq!(m["load_avg_start"], json!([20.0, 20.0, 20.0]));
+        let p1 = Stats::from_json(&m["scenarios"]["P1"]);
+        assert_eq!((p1.p50, p1.p95, p1.max, p1.cmd_p50, p1.refresh_p50), (Some(22.0), Some(44.0), Some(66.0), Some(2.2), Some(21.0)));
+        assert_eq!((p1.n, p1.peak_rss, p1.canvas.as_deref()), (40, Some(100), Some("gpu-rect")));
+        // A scenario no run measured keeps its failure, and the baseline records how many runs.
+        let b = updated_baseline(None, &m);
+        assert_eq!(b["modes"]["full"]["runs"], json!(3));
+        assert_eq!(b["modes"]["full"]["failed"]["P2"], json!("panicked: boom"));
+        assert!(baseline_for(&b, "runner", "full").is_ok_and(|s| s.get("P1").and_then(|s| s.p50) == Some(22.0)));
+        // Runs from different machines or modes don't mix.
+        let mut other = run("2026-10-28", 1.0, 1.0, "gpu-rect");
+        other["machine"]["class"] = json!("laptop");
+        assert!(merged_results(&[runs[0].clone(), other]).is_err());
+        assert!(merged_results(&[]).is_err());
     }
 }

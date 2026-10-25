@@ -2,14 +2,17 @@ name: Perf (nightly)
 
 # The performance scorecard (#221): `cargo xtask perf` on a fixed macOS runner (Apple silicon,
 # Metal), every night and on demand. It never runs on pull requests, so it can't block one.
-# It fails when an enforced budget in perf/budgets.toml breaks or a scenario's p50 regresses
-# more than 15 % against perf/baseline.json from the same machine class (other classes are
-# never compared). The table goes to the job summary; results.json is uploaded as an artifact.
+# It fails when an enforced budget in perf/budgets.toml breaks, and reports a scenario whose p50
+# regresses more than 15 % against perf/baseline.json from the same machine class (other classes
+# are never compared). The table goes to the job summary; results.json is uploaded as an artifact.
 #
-# To give this runner class its own baseline: run it by hand with "update_baseline", download
-# the `perf-baseline` artifact and commit it as perf/baseline.json in a PR. Full runs pass
-# --require-baseline: a baseline from another machine class fails them, since nothing could be
-# compared (a laptop baseline once left the regression check off for weeks).
+# To give this runner class its own baseline: run it by hand with "update_baseline" about five
+# times, one after another, download each run's `perf-results` artifact and commit what
+# `cargo xtask perf --update-baseline --baseline-from <run>/results.json ...` writes (per scenario,
+# the run with its median p50: this runner's numbers swing too much for one night to stand for it). Full runs
+# pass --require-baseline: a baseline from another machine class fails them, since nothing could
+# be compared (a laptop baseline once left the regression check off for weeks). Regressions are
+# reported in the summary, not failed (`regressions_fail` in perf/budgets.toml).
 
 on:
   schedule:

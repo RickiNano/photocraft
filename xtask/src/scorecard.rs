@@ -560,15 +560,23 @@ here supersede estimates elsewhere.\n\n## Summary\n\n| Area | Done | Partial | M
 
     // Performance.
     s.push_str("\n## Performance\n\n");
+    let pct = inp.budgets.settings.regression_pct;
+    let regressions = if inp.budgets.settings.regressions_fail {
+        format!("A p50 more than {pct:.0} % above the baseline's fails it too.")
+    } else {
+        format!(
+            "A p50 more than {pct:.0} % above the baseline's is reported but doesn't fail it: the runner's numbers \
+swing too much from night to night (`regressions_fail` in `perf/budgets.toml`)."
+        )
+    };
     s.push_str(&format!(
         "Budgets: `perf/budgets.toml` (targets from #209, #210, #211). Numbers: the committed baseline \
 (`perf/baseline.json`, full run), updated only by `cargo xtask perf --update-baseline`. The nightly \
-`perf-nightly` workflow runs `cargo xtask perf` on a fixed macOS runner and fails on a broken enforced \
-budget, a p50 regression over {:.0} % against a baseline from the same machine class, or a baseline from \
-another machine class (record it on the runner: run the workflow with `update_baseline`). \"Over budget\" \
-rows are targets the code doesn't meet yet: they are reported, and only their regressions fail. \
-\"Command + refresh\" splits a row's median between the command and the canvas refresh after it.\n\n",
-        inp.budgets.settings.regression_pct
+`perf-nightly` workflow runs `cargo xtask perf` on a fixed macOS runner. It fails on a broken enforced \
+budget, and when the baseline is from another machine class (record it on the runner, from several runs: \
+`--baseline-from`). {regressions} \"Over budget\" rows are targets the code doesn't meet \
+yet: they are reported, not failed. \"Command + refresh\" splits a row's median between the command and \
+the canvas refresh after it.\n\n"
     ));
     match (&base_date, full) {
         (Some(d), Some(f)) => {
@@ -576,8 +584,12 @@ rows are targets the code doesn't meet yet: they are reported, and only their re
             let commit = f.get("commit").and_then(Value::as_str).map_or_else(|| "unknown".into(), |c| c.get(..10).unwrap_or(c).to_string());
             let ram = machine.and_then(|m| m.get("ram_bytes")).and_then(Value::as_u64).map_or_else(|| "?".into(), |b| format!("{} GB", b >> 30));
             let cores = machine.and_then(|m| m.get("cores")).and_then(Value::as_u64).map_or_else(String::new, |n| format!("{n} cores, "));
+            let (runs, of_runs) = match f.get("runs").and_then(Value::as_u64).filter(|&n| n > 1) {
+                Some(n) => (format!(", each scenario from the run with its median p50 among {n} runs (date and commit: the latest)"), " (median)"),
+                None => (String::new(), ""),
+            };
             s.push_str(&format!(
-                "Baseline: {d}, commit `{commit}`, {} ({cores}{ram}), GPU {}, {}; load average {load} (1/5/15 min) at the start of the run.\n\n",
+                "Baseline: {d}, commit `{commit}`{runs}, {} ({cores}{ram}), GPU {}, {}; load average{of_runs} {load} (1/5/15 min) at the start of the run.\n\n",
                 ms("cpu"),
                 ms("gpu_adapter"),
                 ms("os_version")

@@ -408,6 +408,8 @@ cargo xtask perf                 # full benchmark run (tens of minutes, release 
 cargo xtask perf --quick         # small synthetic documents (about a minute once built)
 cargo xtask perf --update-baseline   # also write perf/baseline.json from this run
 cargo xtask perf --require-baseline  # fail when no baseline from this machine class exists (the nightly)
+cargo xtask perf --update-baseline --baseline-from a/results.json --baseline-from b/results.json
+                                     # the baseline from runs already made: per scenario, the run with its median p50
 ```
 
 **Sources.** The scorecard reads only committed files, so it is deterministic:
@@ -423,10 +425,14 @@ cargo xtask perf --require-baseline  # fail when no baseline from this machine c
   a number.
 - `perf/baseline.json`: the numbers the scorecard shows, written only by
   `cargo xtask perf --update-baseline`, with the machine (CPU, RAM, GPU adapter, OS), its machine
-  class, commit, date and load average. Record it on the nightly's runner: run the `perf-nightly`
-  workflow by hand with `update_baseline` and commit its `perf-baseline` artifact. The nightly
-  passes `--require-baseline`, so a baseline from any other machine fails it instead of quietly
-  turning the regression check off.
+  class, commit, date and load average. Record it on the nightly's runner, from several runs: the
+  runner is a shared 3-core VM whose numbers swing 2–20× from night to night on some rows. Run the
+  `perf-nightly` workflow by hand with `update_baseline` about five times (one at a time: the
+  workflow's concurrency group keeps only one pending run), download each run's `perf-results`
+  artifact, and commit what
+  `cargo xtask perf --update-baseline --baseline-from <run1>/results.json --baseline-from …`
+  writes: each scenario's numbers from the run with its median p50. The nightly passes `--require-baseline`, so a
+  baseline from any other machine fails it instead of quietly turning the regression check off.
 - `crates/io/tests/it/corpus.rs`: the corpus floors (every `Source { .. }` constant).
 - The prefs audit: `Preferences` fields that no code reads (target 0, #204), plus counts taken
   from the tree (never-crash attribute coverage, `docs/parity-checklist.md`).
@@ -444,12 +450,14 @@ the GPU and sizes the GPU memory budget as the app does. `target/perf/summary.md
 Markdown table. It exits non-zero when an enforced budget breaks, when a scenario's p50
 regresses more than 15 % (`--threshold`, or `regression_pct`) against a baseline from the same
 machine class and mode, when a bench fails, or with `--require-baseline` when there is no such
-baseline. Runs from different machine classes are never compared, and `--quick` numbers are
+baseline. On the nightly runner a regression is only reported (`regressions_fail = false` in
+`perf/budgets.toml`): measured over nine nights, one night's numbers as the baseline would have
+flagged 10–36 scenarios a night at 15 %. Runs from different machine classes are never compared, and `--quick` numbers are
 only compared with a quick baseline. Machines that run other work give noisy numbers: check the load average in the
 summary before trusting a regression, and record it next to any number you quote.
 
 **Measuring one scenario.** A full run is tens of minutes; one row is seconds once its bench is
-built. `xtask perf`'s own flags are `--quick`, `--update-baseline`, `--require-baseline`, `--threshold`, `--bench`
+built. `xtask perf`'s own flags are `--quick`, `--update-baseline`, `--require-baseline`, `--baseline-from`, `--threshold`, `--bench`
 (repeatable, one bench per name), `--skip-build` and `--reuse`; it has no way to pick a single
 *row*. The bench binary takes those filters itself — `--only <substring>` (row names are matched
 with `contains`), `--group <name>` and `--reps N` — so to time one row run the bench directly:

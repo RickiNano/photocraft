@@ -16,6 +16,11 @@
 regression_pct = 15.0
 # …and by more than this many milliseconds (timer noise on very fast rows).
 regression_min_ms = 1.0
+# Regressions are reported, not failed: the nightly's runner (GitHub macos-15, a 3-core VM) is too
+# noisy to tell one from a slow night. Over nine nightly runs (2026-10-16…25) the same code's p50
+# varied up to 2–20× per scenario; with one night as the baseline, 10–36 scenarios a night would
+# have "regressed" by 15 %, and still 1–4 at 100 %. Set it back to true on a quiet machine.
+regressions_fail = false
 
 [[bench]]
 name = "perf_scenarios"
