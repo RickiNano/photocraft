@@ -195,8 +195,10 @@ pub fn menu(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<
             Ok(doc) => app.pick_file_bytes(move |app, name, bytes| {
                 app.refocus(doc)?;
                 let r = photocraft_engine::notes_cmds::import_notes_from(&mut app.session, &name, &bytes).map_err(|e| e.to_string());
+                // The Notes panel keeps its state; Show Notes comes back on so the imported notes
+                // show, leaving the Extras switch alone as `create_note` does (#13918).
                 if r.is_ok() {
-                    app.ui.analysis.notes = true;
+                    app.ui.view.show.notes = true;
                     app.sync_views();
                 }
                 r
@@ -273,6 +275,10 @@ mod analysis_ruler_click_tests;
 #[cfg(test)]
 #[path = "note_show_on_new_tests.rs"]
 mod note_show_on_new_tests;
+
+#[cfg(test)]
+#[path = "note_import_show_tests.rs"]
+mod note_import_show_tests;
 
 /// Create a note at the rounded document position using the Note tool's options.
 /// After `notes.add` succeeds, select the note and open the Notes panel. Enable Show Notes
