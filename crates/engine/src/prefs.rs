@@ -637,6 +637,9 @@ impl Default for FileHandling {
 #[serde(default, rename_all = "camelCase")]
 pub struct Export {
     pub quick_export_format: QuickExportFormat,
+    /// PNG › Transparency: on, Quick Export keeps transparent pixels (RGBA); off, it writes an
+    /// opaque RGB PNG matted on white (#13784).
+    pub png_transparency: bool,
     pub quick_export_location: ExportLocation,
     pub jpeg_quality: u32,
     /// Keep the existing lossless Quick Export default until the user opts into lossy WebP.
@@ -654,6 +657,7 @@ impl Default for Export {
     fn default() -> Self {
         Self {
             quick_export_format: QuickExportFormat::Png,
+            png_transparency: true,
             quick_export_location: ExportLocation::Ask,
             jpeg_quality: 85,
             webp_lossless: true,

@@ -11,6 +11,7 @@ pub(super) fn export_preferences(s: &mut Session, p: &Value) -> Result<Value> {
     let mut values = serde_json::Map::new();
     for (k, key) in [
         ("quickExportFormat", "export.quickExportFormat"),
+        ("pngTransparency", "export.pngTransparency"),
         ("quickExportLocation", "export.quickExportLocation"),
         ("jpegQuality", "export.jpegQuality"),
         ("webpLossless", "export.webpLossless"),
@@ -100,7 +101,8 @@ pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
         }),
     );
     o.insert("convertToSrgb".into(), json!(prefs.convert_to_srgb));
-    o.insert("transparency".into(), json!(true));
+    // PNG › Transparency off writes an opaque PNG over the white matte; JPG and GIF keep theirs.
+    o.insert("transparency".into(), json!(fmt != "png" || prefs.png_transparency));
     o.insert("matte".into(), json!("#ffffff"));
     match fmt.as_str() {
         "jpg" => {
@@ -150,3 +152,7 @@ pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
     crate::automate_cmds::fire_event(s, "export");
     Ok(json!({"path": path, "format": fmt, "bytes": opt.bytes.len(), "warnings": web_warnings(&st, exif, wdoc.resolution_dpi)}))
 }
+
+#[cfg(test)]
+#[path = "quick_png_transparency_tests.rs"]
+mod quick_png_transparency_tests;

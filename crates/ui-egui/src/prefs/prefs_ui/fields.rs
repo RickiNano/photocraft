@@ -49,6 +49,10 @@ pub(super) fn humanize(key: &str) -> String {
     if key == "webpQuality" {
         return "Quality".into();
     }
+    // Shown only for PNG, under the format, as the reference's Transparency checkbox (#13784).
+    if key == "pngTransparency" {
+        return "Transparency".into();
+    }
     // The auto-hide notice settings read best with their own labels (Interface › Notification, #2022).
     if key == "notificationAutoHide" {
         return "Auto Hide Notifications".into();
@@ -331,6 +335,7 @@ pub(super) fn export_field_visible(obj: &Map<String, Value>, key: &str) -> bool 
     match key {
         "convertToSrgb" | "metadata" => format != "exr",
         "jpegQuality" => format == "jpg",
+        "pngTransparency" => format == "png",
         "webpLossless" => format == "webp",
         "webpQuality" => format == "webp" && obj.get("webpLossless").and_then(Value::as_bool) != Some(true),
         _ => true,
@@ -644,5 +649,19 @@ mod tests {
             }
         }
         assert!(preference_matches("tools", "useTabletPressure", "tablet pressure"));
+    }
+
+    /// PNG's Transparency checkbox shows only while PNG is the Quick Export format (#13784).
+    #[test]
+    fn png_transparency_shows_only_for_png() {
+        use super::{export_field_visible, humanize};
+        let mut obj = serde_json::to_value(photocraft_engine::prefs::Export::default()).unwrap().as_object().unwrap().clone();
+        assert_eq!(obj.get("pngTransparency"), Some(&serde_json::json!(true)));
+        assert!(export_field_visible(&obj, "pngTransparency"), "PNG is the default format");
+        assert_eq!(humanize("pngTransparency"), "Transparency");
+        for format in ["jpg", "gif", "webp", "exr"] {
+            obj.insert("quickExportFormat".into(), serde_json::json!(format));
+            assert!(!export_field_visible(&obj, "pngTransparency"), "{format}");
+        }
     }
 }
